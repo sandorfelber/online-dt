@@ -14,6 +14,7 @@ import gym
 import d4rl
 import torch
 import numpy as np
+import wandb
 
 import utils
 from replay_buffer import ReplayBuffer
@@ -245,9 +246,6 @@ class Experiment:
             device=self.device,
         )
 
-        writer = (
-            SummaryWriter(self.logger.log_path) if self.variant["log_to_tb"] else None
-        )
         while self.pretrain_iter < self.variant["max_pretrain_iters"]:
             # in every iteration, prepare the data loader
             dataloader = create_dataloader(
@@ -275,7 +273,7 @@ class Experiment:
                 outputs,
                 iter_num=self.pretrain_iter,
                 total_transitions_sampled=self.total_transitions_sampled,
-                writer=writer,
+                writer=None
             )
 
             self._save_model(
@@ -321,9 +319,6 @@ class Experiment:
                 reward_scale=self.reward_scale,
             )
         ]
-        writer = (
-            SummaryWriter(self.logger.log_path) if self.variant["log_to_tb"] else None
-        )
         while self.online_iter < self.variant["max_online_iters"]:
 
             outputs = {}
@@ -373,7 +368,7 @@ class Experiment:
                 outputs,
                 iter_num=self.pretrain_iter + self.online_iter,
                 total_transitions_sampled=self.total_transitions_sampled,
-                writer=writer,
+                writer=None
             )
 
             self._save_model(
@@ -462,6 +457,9 @@ class Experiment:
 
         eval_envs.close()
 
+        # Clean up wandb at the end
+        wandb.finish()
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -504,9 +502,10 @@ if __name__ == "__main__":
 
     # environment options
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--log_to_tb", "-w", type=bool, default=True)
     parser.add_argument("--save_dir", type=str, default="./exp")
     parser.add_argument("--exp_name", type=str, default="default")
+    parser.add_argument("--wandb_project", type=str, default="decision-transformer")
+    parser.add_argument("--wandb_entity", type=str, default=None)
 
     args = parser.parse_args()
 
