@@ -26,6 +26,7 @@ from decision_transformer.models.decision_transformer import DecisionTransformer
 from evaluation import create_vec_eval_episodes_fn, vec_evaluate_episode_rtg
 from trainer import SequenceTrainer
 from logger import Logger
+from context_extractor import ContextExtractor
 
 MAX_EPISODE_LEN = 1000
 
@@ -63,6 +64,7 @@ class Experiment:
             ordering=variant["ordering"],
             init_temperature=variant["init_temperature"],
             target_entropy=self.target_entropy,
+            context_dim=variant.get("context_dim", None),
         ).to(device=self.device)
 
         self.optimizer = Lamb(
@@ -105,15 +107,9 @@ class Experiment:
         to_save = {
             "model_state_dict": self.model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
-            "scheduler_state_dict": self.scheduler.state_dict(),
             "pretrain_iter": self.pretrain_iter,
             "online_iter": self.online_iter,
-            "args": self.variant,
             "total_transitions_sampled": self.total_transitions_sampled,
-            "np": np.random.get_state(),
-            "python": random.getstate(),
-            "pytorch": torch.get_rng_state(),
-            "log_temperature_optimizer_state_dict": self.log_temperature_optimizer.state_dict(),
         }
 
         with open(f"{path_prefix}/model.pt", "wb") as f:
@@ -248,6 +244,9 @@ class Experiment:
 
         while self.pretrain_iter < self.variant["max_pretrain_iters"]:
             # in every iteration, prepare the data loader
+            context_extractor = None
+            if self.variant.get("use_context", False):
+                context_extractor = ContextExtractor(feature_dims=self.variant["context_dim"])
             dataloader = create_dataloader(
                 trajectories=self.offline_trajs,
                 num_iters=self.variant["num_updates_per_pretrain_iter"],
@@ -259,6 +258,7 @@ class Experiment:
                 state_std=self.state_std,
                 reward_scale=self.reward_scale,
                 action_range=self.action_range,
+                context_extractor=context_extractor,
             )
 
             train_outputs = trainer.train_iteration(
@@ -329,6 +329,9 @@ class Experiment:
             )
             outputs.update(augment_outputs)
 
+            context_extractor = None
+            if self.variant.get("use_context", False):
+                context_extractor = ContextExtractor(feature_dims=self.variant["context_dim"])
             dataloader = create_dataloader(
                 trajectories=self.replay_buffer.trajectories,
                 num_iters=self.variant["num_updates_per_online_iter"],
@@ -340,6 +343,7 @@ class Experiment:
                 state_std=self.state_std,
                 reward_scale=self.reward_scale,
                 action_range=self.action_range,
+                context_extractor=context_extractor,
             )
 
             # finetuning
@@ -507,10 +511,34 @@ if __name__ == "__main__":
     parser.add_argument("--wandb_project", type=str, default="decision-transformer")
     parser.add_argument("--wandb_entity", type=str, default=None)
 
+    # Add context-related arguments
+    parser.add_argument("--use_context", action="store_true")
+    parser.add_argument("--context_dim", type=int, default=64)
+
+    parser.add_argument("--num_workers", type=int, default=8,
+                       help="Number of dataloader worker processes")
+
     args = parser.parse_args()
 
     utils.set_seed_everywhere(args.seed)
+
+    # Initialize wandb before creating experiment
+    wandb.init(
+        project="decision-transformer",
+        entity="sanyi",
+        name="residual",
+        config=vars(args)
+    )
+
+    # Initialize context extractor if needed
+    context_extractor = None
+    if args.use_context:
+        context_extractor = ContextExtractor(feature_dims=args.context_dim)
+
     experiment = Experiment(vars(args))
 
     print("=" * 50)
     experiment()
+
+    # Close wandb
+    wandb.finish()

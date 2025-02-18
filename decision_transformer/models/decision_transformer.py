@@ -144,6 +144,7 @@ class DecisionTransformer(TrajectoryModel):
         stochastic_policy=False,
         init_temperature=0.1,
         target_entropy=None,
+        context_dim=None,
         **kwargs
     ):
         super().__init__(state_dim, act_dim, max_length=max_length)
@@ -189,6 +190,11 @@ class DecisionTransformer(TrajectoryModel):
             self.log_temperature.requires_grad = True
             self.target_entropy = target_entropy
 
+        self.context_dim = context_dim
+        if context_dim is not None:
+            self.embed_context = torch.nn.Linear(context_dim, hidden_size)
+            self.context_ln = nn.LayerNorm(hidden_size)
+
     def temperature(self):
         if self.stochastic_policy:
             return self.log_temperature.exp()
@@ -202,66 +208,69 @@ class DecisionTransformer(TrajectoryModel):
         rewards,
         returns_to_go,
         timesteps,
-        ordering,
+        ordering=None,
         padding_mask=None,
+        context=None,
     ):
-
         batch_size, seq_length = states.shape[0], states.shape[1]
 
         if padding_mask is None:
-            # attention mask for GPT: 1 if can be attended to, 0 if not
-            padding_mask = torch.ones((batch_size, seq_length), dtype=torch.long)
+            padding_mask = torch.ones((batch_size, seq_length), dtype=torch.long, device=states.device)
 
-        # embed each modality with a different head
-        state_embeddings = self.embed_state(states)
-        action_embeddings = self.embed_action(actions)
-        returns_embeddings = self.embed_return(returns_to_go)
+        # Process in chunks to manage memory
+        chunk_size = min(32, seq_length)
+        num_chunks = (seq_length + chunk_size - 1) // chunk_size
 
-        if self.ordering:
-            order_embeddings = self.embed_ordering(timesteps)
-        else:
-            order_embeddings = 0.0
-
-        state_embeddings = state_embeddings + order_embeddings
-        action_embeddings = action_embeddings + order_embeddings
-        returns_embeddings = returns_embeddings + order_embeddings
-
-        # this makes the sequence look like (R_1, s_1, a_1, R_2, s_2, a_2, ...)
-        # which works nice in an autoregressive sense since states predict actions
-        stacked_inputs = (
-            torch.stack(
-                (returns_embeddings, state_embeddings, action_embeddings), dim=1
+        with torch.cuda.amp.autocast(enabled=True):
+            # Pre-allocate output tensor
+            stacked_inputs = torch.empty(
+                (batch_size, 3 * seq_length, self.hidden_size),
+                dtype=torch.float32,
+                device=states.device
             )
-            .permute(0, 2, 1, 3)
-            .reshape(batch_size, 3 * seq_length, self.hidden_size)
-        )
-        stacked_inputs = self.embed_ln(stacked_inputs)
 
-        # to make the attention mask fit the stacked inputs, have to stack it as well
-        stacked_padding_mask = (
-            torch.stack((padding_mask, padding_mask, padding_mask), dim=1)
-            .permute(0, 2, 1)
-            .reshape(batch_size, 3 * seq_length)
-        )
+            for chunk_idx in range(num_chunks):
+                start_idx = chunk_idx * chunk_size
+                end_idx = min(start_idx + chunk_size, seq_length)
+                
+                # Process chunk
+                with torch.no_grad():
+                    chunk_states = states[:, start_idx:end_idx]
+                    chunk_actions = actions[:, start_idx:end_idx]
+                    chunk_returns = returns_to_go[:, start_idx:end_idx]
+                    chunk_timesteps = timesteps[:, start_idx:end_idx]
 
-        # we feed in the input embeddings (not word indices as in NLP) to the model
-        transformer_outputs = self.transformer(
-            inputs_embeds=stacked_inputs,
-            attention_mask=stacked_padding_mask,
-        )
-        x = transformer_outputs["last_hidden_state"]
+                    state_embeddings = self.embed_state(chunk_states)
+                    action_embeddings = self.embed_action(chunk_actions)
+                    returns_embeddings = self.embed_return(chunk_returns)
+                    time_embeddings = self.embed_timestep(chunk_timesteps)
 
-        # reshape x so that the second dimension corresponds to the original
-        # returns (0), states (1), or actions (2); i.e. x[:,1,t] is the token for s_t
-        x = x.reshape(batch_size, seq_length, 3, self.hidden_size).permute(0, 2, 1, 3)
+                    # Fill chunk in output tensor
+                    for i in range(end_idx - start_idx):
+                        abs_idx = start_idx + i
+                        stacked_inputs[:, 3*abs_idx] = returns_embeddings[:, i]
+                        stacked_inputs[:, 3*abs_idx+1] = state_embeddings[:, i]
+                        stacked_inputs[:, 3*abs_idx+2] = action_embeddings[:, i]
 
-        # get predictions
-        # predict next return given state and action
-        return_preds = self.predict_return(x[:, 2])
-        # predict next state given state and action
-        state_preds = self.predict_state(x[:, 2])
-        # predict next action given state
-        action_preds = self.predict_action(x[:, 1])
+                    del state_embeddings, action_embeddings, returns_embeddings, time_embeddings
+                    torch.cuda.empty_cache()
+
+            # Forward through transformer
+            transformer_outputs = self.transformer(
+                inputs_embeds=stacked_inputs,
+                attention_mask=torch.repeat_interleave(padding_mask, 3, dim=1),
+            )
+            
+            x = transformer_outputs["last_hidden_state"]
+            x = x.view(batch_size, seq_length, 3, self.hidden_size)
+
+            # Get predictions
+            return_preds = self.predict_return(x[:, :, 2])
+            state_preds = self.predict_state(x[:, :, 2])
+            action_preds = self.predict_action(x[:, :, 1])
+
+            del stacked_inputs, x, transformer_outputs
+            torch.cuda.empty_cache()
 
         return state_preds, action_preds, return_preds
 
