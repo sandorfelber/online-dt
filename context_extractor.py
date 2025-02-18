@@ -1,3 +1,5 @@
+import numpy as np
+
 class ContextExtractor:
     def __init__(self, feature_dims):
         self.feature_dims = feature_dims

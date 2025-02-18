@@ -55,6 +55,7 @@ class SequenceTrainer:
     def train_step_stochastic(self, loss_fn, trajs):
         if len(trajs) == 9:
             (states, actions, rewards, dones, rtg, timesteps, ordering, padding_mask, context) = trajs
+            context = context.to(device=self.device)
         else:
             (states, actions, rewards, dones, rtg, timesteps, ordering, padding_mask) = trajs
 
