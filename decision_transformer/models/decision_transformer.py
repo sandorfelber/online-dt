@@ -144,6 +144,7 @@ class DecisionTransformer(TrajectoryModel):
         stochastic_policy=False,
         init_temperature=0.1,
         target_entropy=None,
+        context_dim=None,
         **kwargs
     ):
         super().__init__(state_dim, act_dim, max_length=max_length)
@@ -189,6 +190,11 @@ class DecisionTransformer(TrajectoryModel):
             self.log_temperature.requires_grad = True
             self.target_entropy = target_entropy
 
+        self.context_dim = context_dim
+        if context_dim is not None:
+            self.embed_context = torch.nn.Linear(context_dim, hidden_size)
+            self.context_ln = nn.LayerNorm(hidden_size)
+
     def temperature(self):
         if self.stochastic_policy:
             return self.log_temperature.exp()
@@ -203,64 +209,77 @@ class DecisionTransformer(TrajectoryModel):
         returns_to_go,
         timesteps,
         ordering,
+        context=None,
         padding_mask=None,
     ):
-
         batch_size, seq_length = states.shape[0], states.shape[1]
 
-        if padding_mask is None:
-            # attention mask for GPT: 1 if can be attended to, 0 if not
-            padding_mask = torch.ones((batch_size, seq_length), dtype=torch.long)
-
-        # embed each modality with a different head
+        # Embed each modality
         state_embeddings = self.embed_state(states)
         action_embeddings = self.embed_action(actions)
         returns_embeddings = self.embed_return(returns_to_go)
 
         if self.ordering:
             order_embeddings = self.embed_ordering(timesteps)
-        else:
-            order_embeddings = 0.0
+            state_embeddings = state_embeddings + order_embeddings
+            action_embeddings = action_embeddings + order_embeddings
+            returns_embeddings = returns_embeddings + order_embeddings
 
-        state_embeddings = state_embeddings + order_embeddings
-        action_embeddings = action_embeddings + order_embeddings
-        returns_embeddings = returns_embeddings + order_embeddings
-
-        # this makes the sequence look like (R_1, s_1, a_1, R_2, s_2, a_2, ...)
-        # which works nice in an autoregressive sense since states predict actions
-        stacked_inputs = (
-            torch.stack(
+        # Process context if provided using the CONTEXT TOKEN ONLY approach:
+        if context is not None and context.numel() > 0 and self.context_dim is not None:
+            # Create context embedding and normalize it
+            context_embeddings = self.embed_context(context)  # Shape: (batch_size, hidden_size)
+            context_embeddings = self.context_ln(context_embeddings)
+            
+            # Instead of adding (residual addition) to every token,
+            # we use the context as a separate token only:
+            context_token = context_embeddings.unsqueeze(1)  # Shape: (batch_size, 1, hidden_size)
+            
+            # Stack token embeddings without residual addition:
+            stacked_inputs = torch.stack(
                 (returns_embeddings, state_embeddings, action_embeddings), dim=1
-            )
-            .permute(0, 2, 1, 3)
-            .reshape(batch_size, 3 * seq_length, self.hidden_size)
-        )
-        stacked_inputs = self.embed_ln(stacked_inputs)
+            ).permute(0, 2, 1, 3)  # Shape: (batch_size, seq_length, 3, hidden_size)
+            stacked_inputs = stacked_inputs.reshape(batch_size, 3 * seq_length, self.hidden_size)
+            
+            # Prepend the context token to the sequence:
+            stacked_inputs = torch.cat([context_token, stacked_inputs], dim=1)
+            stacked_inputs = self.embed_ln(stacked_inputs)
 
-        # to make the attention mask fit the stacked inputs, have to stack it as well
-        stacked_padding_mask = (
-            torch.stack((padding_mask, padding_mask, padding_mask), dim=1)
-            .permute(0, 2, 1)
-            .reshape(batch_size, 3 * seq_length)
-        )
+            # Update the padding mask to account for the new context token
+            if padding_mask is not None:
+                context_mask = torch.ones((batch_size, 1), device=padding_mask.device)
+                stacked_padding_mask = torch.stack(
+                    (padding_mask, padding_mask, padding_mask), dim=1
+                ).permute(0, 2, 1).reshape(batch_size, 3 * seq_length)
+                padding_mask = torch.cat([context_mask, stacked_padding_mask], dim=1)
+        else:
+            # Original stacking without context
+            stacked_inputs = torch.stack(
+                (returns_embeddings, state_embeddings, action_embeddings), dim=1
+            ).permute(0, 2, 1, 3).reshape(batch_size, 3 * seq_length, self.hidden_size)
+            stacked_inputs = self.embed_ln(stacked_inputs)
+            if padding_mask is not None:
+                padding_mask = torch.stack(
+                    (padding_mask, padding_mask, padding_mask), dim=1
+                ).permute(0, 2, 1).reshape(batch_size, 3 * seq_length)
 
-        # we feed in the input embeddings (not word indices as in NLP) to the model
+        # Continue with transformer processing
         transformer_outputs = self.transformer(
             inputs_embeds=stacked_inputs,
-            attention_mask=stacked_padding_mask,
+            attention_mask=padding_mask,
         )
         x = transformer_outputs["last_hidden_state"]
 
-        # reshape x so that the second dimension corresponds to the original
-        # returns (0), states (1), or actions (2); i.e. x[:,1,t] is the token for s_t
+        # If context was added, remove its output from the results (we only use it as a helper)
+        if context is not None and context.numel() > 0 and self.context_dim is not None:
+            x = x[:, 1:]  # Remove context token
+            
+        # Reshape the output and continue with predictions
         x = x.reshape(batch_size, seq_length, 3, self.hidden_size).permute(0, 2, 1, 3)
-
-        # get predictions
-        # predict next return given state and action
+        
+        # Get predictions: use the appropriate branch tokens for different output predictions.
         return_preds = self.predict_return(x[:, 2])
-        # predict next state given state and action
         state_preds = self.predict_state(x[:, 2])
-        # predict next action given state
         action_preds = self.predict_action(x[:, 1])
 
         return state_preds, action_preds, return_preds

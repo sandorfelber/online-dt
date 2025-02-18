@@ -53,16 +53,10 @@ class SequenceTrainer:
         return logs
 
     def train_step_stochastic(self, loss_fn, trajs):
-        (
-            states,
-            actions,
-            rewards,
-            dones,
-            rtg,
-            timesteps,
-            ordering,
-            padding_mask,
-        ) = trajs
+        if len(trajs) == 9:
+            (states, actions, rewards, dones, rtg, timesteps, ordering, padding_mask, context) = trajs
+        else:
+            (states, actions, rewards, dones, rtg, timesteps, ordering, padding_mask) = trajs
 
         states = states.to(self.device)
         actions = actions.to(self.device)
@@ -75,15 +69,27 @@ class SequenceTrainer:
 
         action_target = torch.clone(actions)
 
-        _, action_preds, _ = self.model.forward(
-            states,
-            actions,
-            rewards,
-            rtg[:, :-1],
-            timesteps,
-            ordering,
-            padding_mask=padding_mask,
-        )
+        if len(trajs) == 9:
+            _, action_preds, _ = self.model.forward(
+                states,
+                actions,
+                rewards,
+                rtg[:, :-1],
+                timesteps,
+                ordering,
+                context=context,
+                padding_mask=padding_mask,
+            )
+        else:
+            _, action_preds, _ = self.model.forward(
+                states,
+                actions,
+                rewards,
+                rtg[:, :-1],
+                timesteps,
+                ordering,
+                padding_mask=padding_mask,
+            )
 
         loss, nll, entropy = loss_fn(
             action_preds,  # a_hat_dist

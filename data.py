@@ -53,6 +53,7 @@ class TransformSamplingSubTraj:
         state_std,
         reward_scale,
         action_range,
+        context_extractor=None,
     ):
         super().__init__()
         self.max_len = max_len
@@ -67,6 +68,7 @@ class TransformSamplingSubTraj:
         # produce NAN when computing the log-likelihood. We clamp them to be within
         # the user defined action range.
         self.action_range = action_range
+        self.context_extractor = context_extractor
 
     def __call__(self, traj):
         si = random.randint(0, traj["rewards"].shape[0] - 1)
@@ -123,7 +125,17 @@ class TransformSamplingSubTraj:
         ordering = torch.from_numpy(ordering).to(dtype=torch.long)
         padding_mask = torch.from_numpy(padding_mask)
 
-        return ss, aa, rr, dd, rtg, timesteps, ordering, padding_mask
+        # Extract context if context_extractor is provided; otherwise return an empty tensor.
+        if self.context_extractor is not None:
+            context = self.context_extractor(traj)
+            context = torch.from_numpy(context).to(dtype=torch.float32)
+        else:
+            context = torch.tensor([], dtype=torch.float32)
+
+        return (
+            ss, aa, rr, dd, rtg, timesteps, 
+            ordering, padding_mask, context
+        )
 
 
 def create_dataloader(
@@ -137,6 +149,7 @@ def create_dataloader(
     state_std,
     reward_scale,
     action_range,
+    context_extractor=None,
     num_workers=24,
 ):
     # total number of subt-rajectories you need to sample
@@ -151,6 +164,7 @@ def create_dataloader(
         state_std=state_std,
         reward_scale=reward_scale,
         action_range=action_range,
+        context_extractor=context_extractor,
     )
 
     subset = SubTrajectory(trajectories, sampling_ind=sampling_ind, transform=transform)

@@ -15,6 +15,7 @@ import d4rl
 import torch
 import numpy as np
 import wandb
+from tqdm import tqdm
 
 import utils
 from replay_buffer import ReplayBuffer
@@ -26,6 +27,7 @@ from decision_transformer.models.decision_transformer import DecisionTransformer
 from evaluation import create_vec_eval_episodes_fn, vec_evaluate_episode_rtg
 from trainer import SequenceTrainer
 from logger import Logger
+from context_extractor import ContextExtractor
 
 MAX_EPISODE_LEN = 1000
 
@@ -63,6 +65,7 @@ class Experiment:
             ordering=variant["ordering"],
             init_temperature=variant["init_temperature"],
             target_entropy=self.target_entropy,
+            context_dim=variant.get("context_dim", None),
         ).to(device=self.device)
 
         self.optimizer = Lamb(
@@ -223,7 +226,7 @@ class Experiment:
 
     def pretrain(self, eval_envs, loss_fn):
         print("\n\n\n*** Pretrain ***")
-
+        
         eval_fns = [
             create_vec_eval_episodes_fn(
                 vec_env=eval_envs,
@@ -246,8 +249,14 @@ class Experiment:
             device=self.device,
         )
 
+        # Create progress bar for pretraining iterations.
+        pbar = tqdm(total=self.variant["max_pretrain_iters"], desc="Pretraining", initial=self.pretrain_iter)
+
         while self.pretrain_iter < self.variant["max_pretrain_iters"]:
             # in every iteration, prepare the data loader
+            context_extractor = None
+            if self.variant.get("use_context", False):
+                context_extractor = ContextExtractor(feature_dims=self.variant["context_dim"])
             dataloader = create_dataloader(
                 trajectories=self.offline_trajs,
                 num_iters=self.variant["num_updates_per_pretrain_iter"],
@@ -259,7 +268,12 @@ class Experiment:
                 state_std=self.state_std,
                 reward_scale=self.reward_scale,
                 action_range=self.action_range,
+                context_extractor=context_extractor,
+                num_workers=16,
             )
+
+            # Create a progress bar for batches within the iteration
+            batch_pbar = tqdm(total=len(dataloader), desc="Processing Batches", leave=False)
 
             train_outputs = trainer.train_iteration(
                 loss_fn=loss_fn,
@@ -281,7 +295,17 @@ class Experiment:
                 is_pretrain_model=True,
             )
 
+            # Update the progress bar display with current loss and evaluation return.
+            pbar.set_postfix({
+                "Loss": outputs.get("training/train_loss_mean", "N/A"),
+                "nll": outputs.get("training/nll", "N/A"),
+                "Eval Return": eval_reward
+            })
+            pbar.update(1)  # Move the progress bar forward
+
             self.pretrain_iter += 1
+            batch_pbar.close()  # Close the batch progress bar
+        pbar.close()  # Close the overall progress bar when done
 
     def evaluate(self, eval_fns):
         eval_start = time.time()
@@ -329,6 +353,9 @@ class Experiment:
             )
             outputs.update(augment_outputs)
 
+            context_extractor = None
+            if self.variant.get("use_context", False):
+                context_extractor = ContextExtractor(feature_dims=self.variant["context_dim"])
             dataloader = create_dataloader(
                 trajectories=self.replay_buffer.trajectories,
                 num_iters=self.variant["num_updates_per_online_iter"],
@@ -340,6 +367,7 @@ class Experiment:
                 state_std=self.state_std,
                 reward_scale=self.reward_scale,
                 action_range=self.action_range,
+                context_extractor=context_extractor,
             )
 
             # finetuning
@@ -507,9 +535,19 @@ if __name__ == "__main__":
     parser.add_argument("--wandb_project", type=str, default="decision-transformer")
     parser.add_argument("--wandb_entity", type=str, default=None)
 
+    # Add context-related arguments
+    parser.add_argument("--use_context", action="store_true")
+    parser.add_argument("--context_dim", type=int, default=64)
+
     args = parser.parse_args()
 
     utils.set_seed_everywhere(args.seed)
+
+    # Initialize context extractor if needed
+    context_extractor = None
+    if args.use_context:
+        context_extractor = ContextExtractor(feature_dims=args.context_dim)
+
     experiment = Experiment(vars(args))
 
     print("=" * 50)
